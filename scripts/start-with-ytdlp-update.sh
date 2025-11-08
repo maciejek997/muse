@@ -2,7 +2,7 @@
 
 # Update yt-dlp to latest version on startup
 echo "🔄 Updating yt-dlp to latest version..."
-pip3 install --no-cache-dir --break-system-packages --upgrade yt-dlp
+pip3 install --no-cache-dir --break-system-packages --upgrade --pre yt-dlp[default] bgutil-ytdlp-pot-provider
 
 # Check yt-dlp version
 echo "📦 yt-dlp version: $(yt-dlp --version)"

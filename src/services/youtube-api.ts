@@ -23,9 +23,11 @@ interface VideoDetailsResponse {
     liveBroadcastContent: string;
     description: string;
     thumbnails: {
-      medium: {
-        url: string;
-      };
+      default?: { url: string; };
+      medium?: { url: string; };
+      high?: { url: string; };
+      standard?: { url: string; };
+      maxres?: { url: string; };
     };
   };
 }
@@ -213,7 +215,12 @@ export default class {
       url: video.id,
       playlist: queuedPlaylist ?? null,
       isLive: video.snippet.liveBroadcastContent === 'live',
-      thumbnailUrl: video.snippet.thumbnails.medium.url,
+      thumbnailUrl: 
+        video.snippet.thumbnails.maxres?.url ||
+        video.snippet.thumbnails.standard?.url ||
+        video.snippet.thumbnails.high?.url ||
+        video.snippet.thumbnails.medium?.url ||
+        `https://img.youtube.com/vi/${video.id}/hqdefault.jpg`,
     };
 
     if (!shouldSplitChapters) {

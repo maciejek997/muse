@@ -15,6 +15,22 @@ export default class FileCacheProvider {
 
   constructor(@inject(TYPES.Config) config: Config) {
     this.config = config;
+    this.ensureDirectories().catch(err => {
+      debug('CRITICAL: Failed to create cache directories!', err);
+      process.exit(1);
+    });
+  }
+
+  private async ensureDirectories() {
+    const cacheDir = this.config.CACHE_DIR;
+    const tmpDir = path.join(cacheDir, 'tmp');
+
+    await fs.mkdir(cacheDir, { recursive: true });
+    await fs.mkdir(tmpDir, { recursive: true });
+
+    debug(`Cache directories ready:
+    → ${cacheDir}
+    → ${tmpDir}`);
   }
 
   /**
@@ -68,29 +84,59 @@ export default class FileCacheProvider {
   createWriteStream(hash: string) {
     const tmpPath = path.join(this.config.CACHE_DIR, 'tmp', hash);
     const finalPath = path.join(this.config.CACHE_DIR, hash);
-
     const stream = createWriteStream(tmpPath);
 
-    stream.on('close', async () => {
-      // Only move if size is non-zero (may have errored out)
-      const stats = await fs.stat(tmpPath);
+    let done = false;
 
-      if (stats.size !== 0) {
+    stream.on('close', async () => {
+      if (done) return;
+      done = true;
+
+      try {
+        const stats = await fs.stat(tmpPath);
+        if (stats.size === 0) return;
+
         await fs.rename(tmpPath, finalPath);
 
-        await prisma.fileCache.create({
-          data: {
+        await prisma.fileCache.upsert({
+          where: { hash },
+          create: {
             hash,
             accessedAt: new Date(),
             bytes: stats.size,
           },
+          update: {},
         });
-      }
 
-      await this.evictOldestIfNecessary();
+        debug(`Cached ${hash} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
+      } catch (err: any) {
+        if (err.code !== 'P2002') debug('Cache error:', err);
+      } finally {
+        await this.evictOldestIfNecessary();
+      }
     });
 
     return stream;
+  }
+
+  async saveToCache(hash: string, stats: number): Promise<void> {
+    try {
+      await prisma.fileCache.upsert({
+        where: { hash },
+        create: {
+          hash,
+          accessedAt: new Date(),
+          bytes: stats,
+        },
+        update: {},
+      });
+
+      debug(`Cached ${hash} (${(stats / 1024 / 1024).toFixed(1)} MB)`);
+    } catch (err: any) {
+      if (err.code !== 'P2002') debug('Cache error:', err);
+    } finally {
+      await this.evictOldestIfNecessary();
+    }
   }
 
   /**
@@ -194,6 +240,10 @@ export default class FileCacheProvider {
     const totalSizeBytes = data._sum.bytes ?? 0;
 
     return totalSizeBytes;
+  }
+
+  public getCacheDir(): string {
+  return this.config.CACHE_DIR;
   }
 
   /**

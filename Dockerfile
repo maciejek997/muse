@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS base
+FROM node:24-trixie-slim AS base
 
 # openssl will be a required package if base is updated to 18.16+ due to node:*-slim base distro change
 # https://github.com/prisma/prisma/issues/19729#issuecomment-1591270599
@@ -11,7 +11,7 @@ RUN apt-get update \
     ca-certificates \
     python3 \
     python3-pip \
-    && pip3 install --no-cache-dir --break-system-packages yt-dlp \
+    && pip3 install --no-cache-dir --break-system-packages --pre yt-dlp[default] bgutil-ytdlp-pot-provider \
     && apt-get autoclean \
     && apt-get autoremove \
     && rm -rf /var/lib/apt/lists/*
@@ -32,20 +32,21 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json .
-COPY yarn.lock .
+# COPY npm.lock .
 
-RUN yarn install --prod
+RUN npm install --production
 RUN cp -R node_modules /usr/app/prod_node_modules
 
-RUN yarn install
+RUN npm update && npm update -D
+
 
 FROM dependencies AS builder
 
 COPY . .
 
 # Run tsc build
-RUN yarn prisma generate
-RUN yarn build
+RUN npx prisma generate
+RUN npm run build
 
 # Only keep what's necessary to run
 FROM base AS runner

@@ -21,6 +21,9 @@ import debug from '../utils/debug.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {Setting} from '@prisma/client';
+import {createWriteStream} from 'fs';
+import path from 'path';
+import { promises as fs } from 'fs';
 
 export enum MediaSource {
   Youtube,
@@ -79,6 +82,7 @@ interface YtDlpFormat {
   asr?: number;
   abr?: number;
   tbr?: number;
+  loudnessDb?: number;
 }
 
 interface YtDlpResponse {
@@ -113,6 +117,7 @@ export default class {
   private disconnectTimer: NodeJS.Timeout | null = null;
 
   private readonly channelToSpeakingUsers: Map<string, Set<string>> = new Map();
+  config: any;
 
   constructor(fileCache: FileCacheProvider, guildId: string) {
     this.fileCache = fileCache;
@@ -281,6 +286,7 @@ export default class {
         this.startTrackingPosition(0);
         this.lastSongURL = currentSong.url;
       }
+      this.prefetchNext();
     } catch (error: unknown) {
       await this.forward(1);
 
@@ -295,6 +301,67 @@ export default class {
 
       throw error;
     }
+  }
+
+    private async prefetchNext(song?: QueuedSong): Promise<void> {
+    const nextSong = this.queue[this.queuePosition + 1];
+    if (!nextSong || nextSong.source !== MediaSource.Youtube) return;
+    if(!song) song = nextSong
+
+    const hash = this.getHashForCache(song.url);
+    const cachePath = path.join(this.fileCache.getCacheDir(), hash);
+
+    if (await this.fileCache.getPathFor(hash)) {
+      debug('Already cached:', song.title);
+      return;
+    }
+
+    const tmpPath = path.join(this.fileCache.getCacheDir(), 'tmp', `${hash}.webm`)
+
+    try {
+      debug('Prefetching (cache only):', song.title);
+      await new Promise<void>((resolve, reject) => {
+        const dl = spawn('yt-dlp', [
+          '--verbose',  // Logs
+          '--no-warnings',
+          '--js-runtimes', 'node',
+          '--cookies', '/usr/app/cookies.txt',
+          '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://muse-pot:4416',
+          '-f', '251/bestaudio[acodec=opus]/bestaudio',
+          '-o', tmpPath,
+          song.url
+        ]);
+
+        let stderr = '';
+        dl.stderr.on('data', (data) => {
+          stderr += data.toString();
+        });
+
+        dl.on('close', (code) => {
+          if (code === 0) {
+            debug(`Prefetch: downloaded ${song.title}`);
+            resolve();
+          } else {
+            debug(`Prefetch failed: ${stderr}`);
+            reject(new Error(`yt-dlp exit code ${code}`));
+          }
+        });
+      });
+
+      await fs.rename(tmpPath, cachePath);
+      const stats = await fs.stat(cachePath);
+      await this.fileCache.saveToCache(hash, stats.size);
+
+      debug(`Prefetch: cached ${song.title} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+    } catch (err) {
+      debug('Prefetch failed (will stream later):', err);
+      await fs.unlink(tmpPath).catch(() => {});
+    }
+}
+  async isSongCached(url: string): Promise<boolean> {
+    const hash = this.getHashForCache(url);
+    const status = await this.fileCache.getPathFor(hash);
+    return Boolean(status);
   }
 
   pause(): void {
@@ -315,6 +382,7 @@ export default class {
     this.manualForward(skip);
 
     try {
+      
       if (this.getCurrent() && this.status !== STATUS.PAUSED) {
         await this.play();
       } else {
@@ -449,6 +517,9 @@ export default class {
     if (song.playlist || !immediate) {
       // Add to end of queue
       this.queue.push(song);
+      if (this.status === STATUS.PLAYING) {
+        this.prefetchNext(song);
+      }
     } else {
       // Add as the next song to be played
       const insertAt = this.queuePosition + 1;
@@ -521,7 +592,7 @@ export default class {
 
   private async getVideoInfoWithYtDlp(url: string): Promise<YtDlpResponse> {
     return new Promise((resolve, reject) => {
-      const ytDlp = spawn('yt-dlp', ['--dump-json', '--no-warnings', url]);
+      const ytDlp = spawn('yt-dlp', ['--dump-json', '--no-warnings', '--js-runtimes', 'node', '--cookies', '/usr/app/cookies.txt', '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://muse-pot:4416', url]);
 
       let stdout = '';
       let stderr = '';
@@ -583,12 +654,13 @@ export default class {
       averageBitrate: format.abr,
       bitrate: format.tbr,
       isLive: info.is_live ?? false,
+      loudnessDb: format.loudnessDb,
     }));
 
     return {
       formats,
       isLive: info.is_live ?? false,
-      lengthSeconds: info.duration?.toString() ?? '0',
+      lengthSeconds: (typeof info.duration === 'number' ? info.duration.toString() : '0'),
     };
   }
 
@@ -597,92 +669,174 @@ export default class {
   }
 
   private async getStream(song: QueuedSong, options: {seek?: number; to?: number} = {}): Promise<Readable> {
-    if (this.status === STATUS.PLAYING) {
-      this.audioPlayer?.stop();
-    } else if (this.status === STATUS.PAUSED) {
-      this.audioPlayer?.stop(true);
-    }
+  if (this.status === STATUS.PLAYING) {
+    this.audioPlayer?.stop();
+  } else if (this.status === STATUS.PAUSED) {
+    this.audioPlayer?.stop(true);
+  }
 
-    if (song.source === MediaSource.HLS) {
-      return this.createReadStream({url: song.url, cacheKey: song.url});
-    }
+  if (song.source === MediaSource.HLS) {
+    return this.createReadStream({url: song.url, cacheKey: song.url, isCached: false});
+  }
 
-    let ffmpegInput: string | null;
-    const ffmpegInputOptions: string[] = [];
-    let shouldCacheVideo = false;
+  let ffmpegInput: string | null;
+  const ffmpegInputOptions: string[] = [];
+  let shouldCacheVideo = false;
 
-    let format: YTDLVideoFormat | undefined;
+  let format: YTDLVideoFormat | undefined;
 
-    ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
+  ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
 
-    if (!ffmpegInput) {
-      // Not yet cached, must download
-      const info = await this.getYouTubeInfo(song.url);
+  if (!ffmpegInput) {
+    // Not yet cached, must download
+    const info = await this.getYouTubeInfo(song.url);
 
-      const {formats} = info;
+    const {formats} = info;
 
-      // Look for the ideal format (opus codec, webm container, 48kHz)
-      const filter = (format: VideoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000 && Boolean(format.url);
+    // Filter: Prefer '251' audio format (Opus with "medium" quality, as described by YouTube)
+    format = formats.find((f: VideoFormat) => f.itag === '251');
 
-      format = formats.find(filter);
+    if (!format) {
+    // Fallback that looks for the ideal format (opus codec, webm container, 48kHz)
+    const filter = (format: VideoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000 && Boolean(format.url);
 
-      const nextBestFormat = (formats: VideoFormat[]): VideoFormat | undefined => {
-        if (formats.length < 1) {
-          return undefined;
-        }
-
-        if (formats[0].isLive) {
-          formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate);
-
-          return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10)));
-        }
-
-        formats = formats
-          .filter(format => format.averageBitrate)
-          .sort((a, b) => {
-            if (a && b) {
-              return b.averageBitrate! - a.averageBitrate!;
-            }
-
-            return 0;
-          });
-        return formats.find(format => !format.bitrate) ?? formats[0];
-      };
-
-      if (!format) {
-        format = nextBestFormat(info.formats);
-
-        if (!format) {
-          // If still no format is found, throw
-          throw new Error('Can\'t find suitable format.');
-        }
+    format = formats.find(filter);
+}
+    const nextBestFormat = (formats: VideoFormat[]): VideoFormat | undefined => {
+      if (formats.length < 1) {
+        return undefined;
       }
 
-      debug('Using format', format);
+      if (formats[0].isLive) {
+        formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate);
 
-      ffmpegInput = format.url;
+        return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10)));
+      }
 
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !info.isLive && parseInt(info.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+      formats = formats
+        .filter(format => format.averageBitrate)
+        .sort((a, b) => {
+          if (a && b) {
+            return b.averageBitrate! - a.averageBitrate!;
+          }
 
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+          return 0;
+        });
+      return formats.find(format => !format.bitrate) ?? formats[0];
+    };
 
-      ffmpegInputOptions.push(...[
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '5',
-      ]);
+    if (!format) {
+      format = nextBestFormat(info.formats);
+
+      if (!format) {
+        // If still no format is found, throw
+        throw new Error('Can\'t find suitable format.');
+      }
     }
 
-    if (options.seek) {
+    debug('Using format', format);
+
+    const hash = this.getHashForCache(song.url);
+    const tmpWebmPath = path.join(this.fileCache.getCacheDir(), 'tmp', `${hash}.webm`);
+
+    let downloaded = false;
+
+    try {
+      await new Promise((resolve, reject) => {
+        let stderr = '';
+        let stdout = '';
+
+        const dl = spawn('yt-dlp', [
+          '--verbose',  // Logs
+          '--no-warnings',
+          '--js-runtimes', 'node',
+          '--cookies', '/usr/app/cookies.txt',
+          '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://muse-pot:4416',
+          '-f', '251/bestaudio[acodec=opus]/bestaudio',
+          '-o', tmpWebmPath,
+          song.url
+        ]);
+
+        dl.stdout.on('data', (data) => { stdout += data.toString(); });
+        dl.stderr.on('data', (data) => { stderr += data.toString(); });
+
+        dl.on('close', (code) => {
+          debug(`yt-dlp stdout: ${stdout}`);
+          debug(`yt-dlp stderr: ${stderr}`);
+
+          if (code === 0) {
+            downloaded = true;
+            resolve(null);
+          } else {
+            reject(new Error(`yt-dlp failed: code ${code}, stderr: ${stderr}`));
+          }
+        });
+      });
+
+      ffmpegInput = tmpWebmPath;
+    } catch (err) {
+      debug('yt-dlp failed, fallback to stream:', err);
+      ffmpegInput = format.url;
+    }
+
+    const MAX_CACHE_LENGTH_SECONDS = 120 * 60; // 2 hours
+    shouldCacheVideo = !info.isLive && parseInt(info.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+
+    debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+
+    ffmpegInputOptions.push(...[
+      '-reconnect',
+      '1',
+      '-reconnect_streamed',
+      '1',
+      '-reconnect_delay_max',
+      '5',
+    ]);
+
+    if (typeof options.seek === 'number') {
       ffmpegInputOptions.push('-ss', options.seek.toString());
     }
 
-    if (options.to) {
+    if (typeof options.to === 'number') {
+      ffmpegInputOptions.push('-to', options.to.toString());
+    }
+
+    if (ffmpegInput.startsWith('/')) {
+      const cleanOptions: string[] = [];
+      for (let i = 0; i < ffmpegInputOptions.length; i += 2) {
+        const opt = ffmpegInputOptions[i];
+        const val = ffmpegInputOptions[i + 1];
+        if (opt !== '-reconnect' && opt !== '-reconnect_streamed' && opt !== '-reconnect_delay_max') {
+          cleanOptions.push(opt, val);
+        }
+      }
+      ffmpegInputOptions.length = 0;
+      ffmpegInputOptions.push(...cleanOptions);
+    }
+
+    const stream = await this.createReadStream({
+      url: ffmpegInput,
+      cacheKey: song.url,
+      ffmpegInputOptions,
+      cache: shouldCacheVideo,
+      volumeAdjustment: format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined,
+      format: format,
+      isCached: false
+    });
+
+    if (downloaded) {
+      stream.on('close', async () => {
+        await fs.unlink(tmpWebmPath).catch(() => {});
+      });
+    }
+
+    return stream;
+  } else {
+    if (typeof options.seek === 'number') {
+      ffmpegInputOptions.push('-ss', options.seek.toString());
+    }
+
+    if (typeof options.to === 'number') {
       ffmpegInputOptions.push('-to', options.to.toString());
     }
 
@@ -690,10 +844,13 @@ export default class {
       url: ffmpegInput,
       cacheKey: song.url,
       ffmpegInputOptions,
-      cache: shouldCacheVideo,
-      volumeAdjustment: format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined,
+      cache: false,
+      volumeAdjustment: undefined,
+      format: undefined,
+      isCached: true
     });
   }
+}
 
   private startTrackingPosition(initalPosition?: number): void {
     if (initalPosition !== undefined) {
@@ -761,14 +918,23 @@ export default class {
       const settings = await getGuildSettings(this.guildId);
       const {autoAnnounceNextSong} = settings;
       if (autoAnnounceNextSong && this.currentChannel) {
-        await this.currentChannel.send({
-          embeds: this.getCurrent() ? [buildPlayingMessageEmbed(this)] : [],
-        });
+        if (this.getCurrent()) {
+          await this.currentChannel.send({
+            embeds: [buildPlayingMessageEmbed(this)],
+          });
+        } else {
+          await this.currentChannel.send({
+            content: 'Queue is now empty!',
+          });
+        }
       }
     }
   }
 
-  private async createReadStream(options: {url: string; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean; volumeAdjustment?: string}): Promise<Readable> {
+  private async createReadStream(options: {url: string, cacheKey: string, ffmpegInputOptions?: string[]; cache?: boolean; volumeAdjustment?: string; format?: VideoFormat; isCached?: boolean}): Promise<Readable> {
+    debug('createReadStream options:', options);
+
+
     return new Promise((resolve, reject) => {
       const capacitor = new WriteStream();
 
@@ -781,12 +947,39 @@ export default class {
       let hasReturnedStreamClosed = false;
 
       const stream = ffmpeg(options.url)
-        .inputOptions(options?.ffmpegInputOptions ?? ['-re'])
-        .noVideo()
-        .audioCodec('libopus')
-        .outputFormat('webm')
-        .addOutputOption(['-filter:a', `volume=${options?.volumeAdjustment ?? '1'}`])
+        .inputOptions([
+          ...(options?.ffmpegInputOptions ?? []),
+          ...(options.url.startsWith('http') ? ['-re'] : [])
+        ])
+        .noVideo();
+
+      debug('Calculating isCompatibleForCopy: isCached =', options.isCached, ', format codecs =', options.format?.codecs, ', container =', options.format?.container, ', sampleRate =', options.format?.audioSampleRate);
+
+      const isCompatibleForCopy = (options.isCached === true) ||
+        (options.format &&
+        options.format.codecs === 'opus' &&
+        options.format.container === 'webm' &&
+        parseInt(options.format.audioSampleRate || '0', 10) === 48000);
+
+      if (isCompatibleForCopy) {
+        stream
+          .outputFormat('webm')
+          .audioCodec('copy');
+        if (!options.isCached && options.volumeAdjustment) {
+          stream.addOutputOption(['-filter:a', `volume=${options.volumeAdjustment}`]);
+        }
+      } else {
+        stream
+          .audioCodec('libopus')
+          .audioBitrate('160k')
+          .outputFormat('webm')
+          .addOutputOption(['-filter:a', `volume=${options?.volumeAdjustment ?? '1'}`]);
+      }
+
+      stream
         .on('error', error => {
+          debug('ffmpeg error:', error);
+
           if (!hasReturnedStreamClosed) {
             reject(error);
           }
