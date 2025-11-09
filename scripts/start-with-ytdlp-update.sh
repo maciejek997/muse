@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/ash
 
 # Update yt-dlp to latest version on startup
 echo "🔄 Updating yt-dlp to latest version..."

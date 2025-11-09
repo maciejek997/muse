@@ -1,20 +1,16 @@
-FROM node:24-trixie-slim AS base
+FROM node:24-alpine AS base
 
 # openssl will be a required package if base is updated to 18.16+ due to node:*-slim base distro change
 # https://github.com/prisma/prisma/issues/19729#issuecomment-1591270599
 # Install ffmpeg and yt-dlp (will be updated on container start)
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
+RUN apk add --no-cache \
     ffmpeg \
     tini \
     openssl \
     ca-certificates \
     python3 \
-    python3-pip \
-    && pip3 install --no-cache-dir --break-system-packages --pre yt-dlp[default] bgutil-ytdlp-pot-provider \
-    && apt-get autoclean \
-    && apt-get autoremove \
-    && rm -rf /var/lib/apt/lists/*
+    py3-pip \
+    && pip3 install --no-cache-dir --break-system-packages --pre yt-dlp[default] bgutil-ytdlp-pot-provider
 
 # Install dependencies
 FROM base AS dependencies
@@ -22,14 +18,9 @@ FROM base AS dependencies
 WORKDIR /usr/app
 
 # Add Python and build tools to compile native modules
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
+RUN apk add --no-cache \
     python3 \
-    python-is-python3 \
-    build-essential \
-    && apt-get autoclean \
-    && apt-get autoremove \
-    && rm -rf /var/lib/apt/lists/*
+    build-base
 
 COPY package.json .
 # COPY npm.lock .
