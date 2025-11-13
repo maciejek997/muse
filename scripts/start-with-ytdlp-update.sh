@@ -2,7 +2,7 @@
 
 # Update yt-dlp to latest version on startup
 echo "🔄 Updating yt-dlp to latest version..."
-pip3 install --no-cache-dir --break-system-packages --upgrade --pre yt-dlp[default] bgutil-ytdlp-pot-provider
+pip3 install --no-cache-dir --break-system-packages --upgrade yt-dlp[default] bgutil-ytdlp-pot-provider # "--pre" removed - new yt-dlp version, no more nightlies
 
 # Check yt-dlp version
 echo "📦 yt-dlp version: $(yt-dlp --version)"

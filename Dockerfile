@@ -10,7 +10,7 @@ RUN apk add --no-cache \
     ca-certificates \
     python3 \
     py3-pip \
-    && pip3 install --no-cache-dir --break-system-packages --pre yt-dlp[default] bgutil-ytdlp-pot-provider
+    && pip3 install --no-cache-dir --break-system-packages yt-dlp[default] bgutil-ytdlp-pot-provider # "--pre" removed - new yt-dlp version, no more nightlies
 
 # Install dependencies
 FROM base AS dependencies
